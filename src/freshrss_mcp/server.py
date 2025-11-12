@@ -37,6 +37,7 @@ class GetArticlesParams(BaseModel):
     count: int = Field(50, description="Number of articles to fetch (max ~1000)")
     order: str = Field("newest", description="Sort order: 'newest' or 'oldest'")
     continuation: Optional[str] = Field(None, description="Continuation token for pagination")
+    trim_content: bool = Field(True, description="trim default article body and content to first 300 characters to not overwhelm models context.")
 
 
 class MarkArticlesParams(BaseModel):
@@ -274,28 +275,20 @@ async def freshrss_get_articles(params: GetArticlesParams) -> Dict[str, Any]:
                 exclude_target=exclude_target,
                 continuation=params.continuation
             )
-            stream_id = "user/-/state/com.google/starred"
-            # Set exclude target for unread only
-            exclude_target = None if params.show_read else "user/-/state/com.google/read"
-            
-            # Fetch articles
-            stream = await client.get_stream_contents(
-                stream_id=stream_id,
-                count=params.count,
-                order="d" if params.order == "newest" else "o",
-                exclude_target=exclude_target,
-                continuation=params.continuation
-            )
+
+
             
             # Format articles
             articles = []
             for article in stream.items:
+                content = article.content or ""
+                summary = article.summary or ""
                 articles.append({
                 "id": article.id,
                 "title": article.title,
                 "url": article.url,
-                "content": article.content,
-                "summary": article.summary,
+                "content": content[:300] if params.trim_content else content,
+                "summary": summary[:300] if params.trim_content else summary,
                 "author": article.author,
                 "published": article.published.isoformat() if article.published else None,
                 "feed_title": article.feed_title,

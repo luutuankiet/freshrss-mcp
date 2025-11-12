@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "freshrss-mcp"
-version = "0.1.2"
+version = "0.2.0"
 description = "A Model Context Protocol server for FreshRSS RSS reader"
 readme = "README.md"
 license = "MIT"
