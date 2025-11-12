@@ -21,10 +21,6 @@ logger = logging.getLogger(__name__)
 # Initialize MCP server
 mcp = FastMCP("FreshRSS MCP Server")
 
-# Global client instance
-client: Optional[FreshRSSClient] = None
-
-
 class AuthenticateParams(BaseModel):
     """Parameters for authentication."""
     base_url: Optional[str] = Field(None, description="FreshRSS instance URL (uses env if not provided)")
@@ -66,37 +62,35 @@ class UnsubscribeParams(BaseModel):
     feed_url: str = Field(..., description="URL of the feed to unsubscribe from")
 
 
-async def ensure_authenticated():
-    """Ensure the client is authenticated."""
-    global client
-    if client is None:
-        # Try to create client from environment variables
-        base_url = os.getenv("FRESHRSS_URL")
-        email = os.getenv("FRESHRSS_EMAIL")
-        api_password = os.getenv("FRESHRSS_API_PASSWORD")
-        
-        if not all([base_url, email, api_password]):
-            raise AuthenticationError(
-                "Not authenticated. Please call freshrss_authenticate first or set environment variables."
-            )
-        
-        client = FreshRSSClient(base_url, email, api_password)
-        await client.authenticate()
+async def ensure_authenticated() -> FreshRSSClient:
+    """Create and authenticate a new client instance."""
+    base_url = os.getenv("FRESHRSS_URL")
+    email = os.getenv("FRESHRSS_EMAIL")
+    api_password = os.getenv("FRESHRSS_API_PASSWORD")
+
+    if not all([base_url, email, api_password]):
+        raise AuthenticationError(
+            "Authentication details not found in environment variables. "
+            "Please set FRESHRSS_URL, FRESHRSS_EMAIL, and FRESHRSS_API_PASSWORD."
+        )
+
+    assert base_url is not None
+    assert email is not None
+    assert api_password is not None
+    client = FreshRSSClient(base_url, email, api_password)
+    await client.authenticate()
     return client
 
 
 @mcp.tool()
 async def freshrss_authenticate(params: AuthenticateParams) -> Dict[str, Any]:
-    """Authenticate with FreshRSS instance.
+    """Authenticate with FreshRSS instance and save credentials to environment for subsequent calls.
     
     Uses provided parameters or falls back to environment variables:
     - FRESHRSS_URL
-    - FRESHRSS_EMAIL  
+    - FRESHRSS_EMAIL
     - FRESHRSS_API_PASSWORD
     """
-    global client
-    
-    # Get credentials
     base_url = params.base_url or os.getenv("FRESHRSS_URL")
     email = params.email or os.getenv("FRESHRSS_EMAIL")
     api_password = params.api_password or os.getenv("FRESHRSS_API_PASSWORD")
@@ -108,14 +102,18 @@ async def freshrss_authenticate(params: AuthenticateParams) -> Dict[str, Any]:
         }
     
     try:
-        # Close existing client if any
-        if client:
-            await client.close()
+        # Store credentials in environment for this session
+        assert base_url is not None
+        assert email is not None
+        assert api_password is not None
+        os.environ["FRESHRSS_URL"] = base_url
+        os.environ["FRESHRSS_EMAIL"] = email
+        os.environ["FRESHRSS_API_PASSWORD"] = api_password
         
-        # Create new client
-        client = FreshRSSClient(base_url, email, api_password)
-        auth_response = await client.authenticate()
-        
+        # Test authentication
+        async with FreshRSSClient(base_url, email, api_password) as client:
+            await client.authenticate()
+
         return {
             "success": True,
             "message": "Successfully authenticated with FreshRSS",
@@ -134,10 +132,10 @@ async def freshrss_authenticate(params: AuthenticateParams) -> Dict[str, Any]:
 async def freshrss_get_token() -> Dict[str, Any]:
     """Get edit token for write operations. Usually called automatically when needed."""
     try:
-        client = await ensure_authenticated()
-        token = await client.get_token()
-        return {
-            "success": True,
+        async with await ensure_authenticated() as client:
+            token = await client.get_token()
+            return {
+                "success": True,
             "token": token,
             "message": "Token retrieved successfully"
         }
@@ -153,13 +151,13 @@ async def freshrss_get_token() -> Dict[str, Any]:
 async def freshrss_list_folders() -> Dict[str, Any]:
     """List all folders/categories/tags in FreshRSS."""
     try:
-        client = await ensure_authenticated()
-        tag_list = await client.get_tag_list()
-        
-        folders = []
-        for tag in tag_list.folders:
-            folders.append({
-                "name": tag.label,
+        async with await ensure_authenticated() as client:
+            tag_list = await client.get_tag_list()
+            
+            folders = []
+            for tag in tag_list.folders:
+                folders.append({
+                    "name": tag.label,
                 "id": tag.id,
                 "type": "folder"
             })
@@ -181,14 +179,14 @@ async def freshrss_list_folders() -> Dict[str, Any]:
 async def freshrss_list_subscriptions() -> Dict[str, Any]:
     """List all subscribed feeds with their folders."""
     try:
-        client = await ensure_authenticated()
-        subscription_list = await client.get_subscription_list()
-        
-        subscriptions = []
-        for sub in subscription_list.subscriptions:
-            folders = [cat.label for cat in sub.categories if cat.is_label]
-            subscriptions.append({
-                "title": sub.title,
+        async with await ensure_authenticated() as client:
+            subscription_list = await client.get_subscription_list()
+            
+            subscriptions = []
+            for sub in subscription_list.subscriptions:
+                folders = [cat.label for cat in sub.categories if cat.is_label]
+                subscriptions.append({
+                    "title": sub.title,
                 "feed_url": sub.feed_id,
                 "id": sub.id,
                 "folders": folders,
@@ -214,27 +212,27 @@ async def freshrss_list_subscriptions() -> Dict[str, Any]:
 async def freshrss_get_unread_count() -> Dict[str, Any]:
     """Get unread counts by feed and folder."""
     try:
-        client = await ensure_authenticated()
-        unread_counts = await client.get_unread_counts()
-        
-        # Organize counts by type
-        feeds = []
-        folders = []
-        total_unread = 0
-        
-        for count in unread_counts:
-            if count.id.startswith("feed/"):
-                feeds.append({
-                    "feed_url": count.id[5:],
+        async with await ensure_authenticated() as client:
+            unread_counts = await client.get_unread_counts()
+            
+            # Organize counts by type
+            feeds = []
+            folders = []
+            total_unread = 0
+            
+            for count in unread_counts:
+                if count.id.startswith("feed/"):
+                    feeds.append({
+                        "feed_url": count.id[5:],
                     "count": count.count
                 })
-            elif count.id.startswith("user/-/label/"):
-                folders.append({
-                    "folder": count.id.split("/")[-1],
-                    "count": count.count
-                })
-            elif count.id == "user/-/state/com.google/reading-list":
-                total_unread = count.count
+                elif count.id.startswith("user/-/label/"):
+                    folders.append({
+                        "folder": count.id.split("/")[-1],
+                        "count": count.count
+                    })
+                elif count.id == "user/-/state/com.google/reading-list":
+                    total_unread = count.count
         
         return {
             "success": True,
@@ -254,34 +252,45 @@ async def freshrss_get_unread_count() -> Dict[str, Any]:
 async def freshrss_get_articles(params: GetArticlesParams) -> Dict[str, Any]:
     """Fetch articles with various filters."""
     try:
-        client = await ensure_authenticated()
-        
-        # Determine stream ID
-        if params.starred_only:
+        async with await ensure_authenticated() as client:
+            # Determine stream ID
+            if params.starred_only:
+                stream_id = "user/-/state/com.google/starred"
+            elif params.folder:
+                stream_id = f"user/-/label/{params.folder}"
+            elif params.feed_url:
+                stream_id = f"feed/{params.feed_url}"
+            else:
+                stream_id = "user/-/state/com.google/reading-list"
+            
+            # Set exclude target for unread only
+            exclude_target = None if params.show_read else "user/-/state/com.google/read"
+            
+            # Fetch articles
+            stream = await client.get_stream_contents(
+                stream_id=stream_id,
+                count=params.count,
+                order="d" if params.order == "newest" else "o",
+                exclude_target=exclude_target,
+                continuation=params.continuation
+            )
             stream_id = "user/-/state/com.google/starred"
-        elif params.folder:
-            stream_id = f"user/-/label/{params.folder}"
-        elif params.feed_url:
-            stream_id = f"feed/{params.feed_url}"
-        else:
-            stream_id = "user/-/state/com.google/reading-list"
-        
-        # Set exclude target for unread only
-        exclude_target = None if params.show_read else "user/-/state/com.google/read"
-        
-        # Fetch articles
-        stream = await client.get_stream_contents(
-            stream_id=stream_id,
-            count=params.count,
-            order="d" if params.order == "newest" else "o",
-            exclude_target=exclude_target,
-            continuation=params.continuation
-        )
-        
-        # Format articles
-        articles = []
-        for article in stream.items:
-            articles.append({
+            # Set exclude target for unread only
+            exclude_target = None if params.show_read else "user/-/state/com.google/read"
+            
+            # Fetch articles
+            stream = await client.get_stream_contents(
+                stream_id=stream_id,
+                count=params.count,
+                order="d" if params.order == "newest" else "o",
+                exclude_target=exclude_target,
+                continuation=params.continuation
+            )
+            
+            # Format articles
+            articles = []
+            for article in stream.items:
+                articles.append({
                 "id": article.id,
                 "title": article.title,
                 "url": article.url,
@@ -315,11 +324,11 @@ async def freshrss_get_articles(params: GetArticlesParams) -> Dict[str, Any]:
 async def freshrss_mark_read(params: MarkArticlesParams) -> Dict[str, Any]:
     """Mark articles as read."""
     try:
-        client = await ensure_authenticated()
-        response = await client.mark_as_read(params.article_ids)
-        
-        return {
-            "success": True,
+        async with await ensure_authenticated() as client:
+            response = await client.mark_as_read(params.article_ids)
+            
+            return {
+                "success": True,
             "message": f"Marked {len(params.article_ids)} article(s) as read",
             "status": response.status
         }
@@ -335,11 +344,11 @@ async def freshrss_mark_read(params: MarkArticlesParams) -> Dict[str, Any]:
 async def freshrss_mark_unread(params: MarkArticlesParams) -> Dict[str, Any]:
     """Mark articles as unread."""
     try:
-        client = await ensure_authenticated()
-        response = await client.mark_as_unread(params.article_ids)
-        
-        return {
-            "success": True,
+        async with await ensure_authenticated() as client:
+            response = await client.mark_as_unread(params.article_ids)
+            
+            return {
+                "success": True,
             "message": f"Marked {len(params.article_ids)} article(s) as unread",
             "status": response.status
         }
@@ -355,11 +364,11 @@ async def freshrss_mark_unread(params: MarkArticlesParams) -> Dict[str, Any]:
 async def freshrss_star_article(params: MarkArticlesParams) -> Dict[str, Any]:
     """Star articles."""
     try:
-        client = await ensure_authenticated()
-        response = await client.star_article(params.article_ids)
-        
-        return {
-            "success": True,
+        async with await ensure_authenticated() as client:
+            response = await client.star_article(params.article_ids)
+            
+            return {
+                "success": True,
             "message": f"Starred {len(params.article_ids)} article(s)",
             "status": response.status
         }
@@ -375,11 +384,11 @@ async def freshrss_star_article(params: MarkArticlesParams) -> Dict[str, Any]:
 async def freshrss_unstar_article(params: MarkArticlesParams) -> Dict[str, Any]:
     """Unstar articles."""
     try:
-        client = await ensure_authenticated()
-        response = await client.unstar_article(params.article_ids)
-        
-        return {
-            "success": True,
+        async with await ensure_authenticated() as client:
+            response = await client.unstar_article(params.article_ids)
+            
+            return {
+                "success": True,
             "message": f"Unstarred {len(params.article_ids)} article(s)",
             "status": response.status
         }
@@ -395,11 +404,11 @@ async def freshrss_unstar_article(params: MarkArticlesParams) -> Dict[str, Any]:
 async def freshrss_add_label(params: AddLabelParams) -> Dict[str, Any]:
     """Add label to articles."""
     try:
-        client = await ensure_authenticated()
-        response = await client.add_label(params.article_ids, params.label)
-        
-        return {
-            "success": True,
+        async with await ensure_authenticated() as client:
+            response = await client.add_label(params.article_ids, params.label)
+            
+            return {
+                "success": True,
             "message": f"Added label '{params.label}' to {len(params.article_ids)} article(s)",
             "status": response.status
         }
@@ -415,10 +424,10 @@ async def freshrss_add_label(params: AddLabelParams) -> Dict[str, Any]:
 async def freshrss_subscribe(params: SubscribeParams) -> Dict[str, Any]:
     """Subscribe to a new feed."""
     try:
-        client = await ensure_authenticated()
-        response = await client.subscribe(
-            feed_url=params.feed_url,
-            title=params.title,
+        async with await ensure_authenticated() as client:
+            response = await client.subscribe(
+                feed_url=params.feed_url,
+                title=params.title,
             folder=params.folder
         )
         
@@ -439,11 +448,11 @@ async def freshrss_subscribe(params: SubscribeParams) -> Dict[str, Any]:
 async def freshrss_unsubscribe(params: UnsubscribeParams) -> Dict[str, Any]:
     """Unsubscribe from a feed."""
     try:
-        client = await ensure_authenticated()
-        response = await client.unsubscribe(params.feed_url)
-        
-        return {
-            "success": True,
+        async with await ensure_authenticated() as client:
+            response = await client.unsubscribe(params.feed_url)
+            
+            return {
+                "success": True,
             "message": f"Successfully unsubscribed from {params.feed_url}",
             "status": response.status
         }

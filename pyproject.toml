@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "freshrss-mcp"
-version = "0.1.0"
+version = "0.1.2"
 description = "A Model Context Protocol server for FreshRSS RSS reader"
 readme = "README.md"
 license = "MIT"
@@ -25,7 +25,7 @@ classifiers = [
 requires-python = ">=3.9"
 dependencies = [
     "mcp>=1.0.0",
-    "httpx>=0.25.0",
+    "aiohttp>=3.8.0",
     "python-dotenv>=1.0.0",
     "pydantic>=2.0.0",
     "typing-extensions>=4.8.0",
