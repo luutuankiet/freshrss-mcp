@@ -11,6 +11,9 @@ from pydantic import BaseModel, Field
 
 from .client import FreshRSSClient, FreshRSSError, AuthenticationError
 
+from mcp.server.transport_security import TransportSecuritySettings  
+  
+
 # Load environment variables
 load_dotenv()
 
@@ -18,8 +21,12 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+security_settings = TransportSecuritySettings(  
+    enable_dns_rebinding_protection=False  
+)  
 # Initialize MCP server
-mcp = FastMCP("FreshRSS MCP Server")
+mcp = FastMCP("FreshRSS MCP Server", transport_security=security_settings)
+
 
 class AuthenticateParams(BaseModel):
     """Parameters for authentication."""
