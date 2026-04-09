@@ -293,6 +293,30 @@ class FreshRSSClient:
             remove_tags=["user/-/state/com.google/read"],
         )
 
+    async def mark_all_as_read(self, stream_id: str, older_than_usec: Optional[int] = None) -> EditResponse:
+        """Mark all articles in a stream as read.
+        
+        Uses the Google Reader API mark-all-as-read endpoint.
+        Much more efficient than marking individual articles.
+        
+        Args:
+            stream_id: Stream to mark (e.g., 'user/-/state/com.google/reading-list', 'user/-/label/tech')
+            older_than_usec: Optional timestamp in microseconds. Articles older than this are marked read.
+                           If None, marks all articles in the stream as read.
+        """
+        if not self.edit_token:
+            await self.get_token()
+        
+        data: List[Tuple[str, Optional[str]]] = [
+            ("T", self.edit_token),
+            ("s", stream_id),
+        ]
+        if older_than_usec is not None:
+            data.append(("ts", str(older_than_usec)))
+        
+        response = await self._request("POST", "reader/api/0/mark-all-as-read", data=data)
+        return EditResponse(status=(await response.text()).strip())
+
     async def star_article(self, item_ids: List[str]) -> EditResponse:
         """Star articles."""
         return await self._edit_tag(

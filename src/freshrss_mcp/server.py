@@ -18,6 +18,32 @@ from mcp.server.transport_security import TransportSecuritySettings
 # Load environment variables
 load_dotenv()
 
+# --- Configurable short ID length ---
+# Article IDs look like: tag:google.com,2005:reader/item/00064efa1097fab5
+# The hex suffix is the unique part. We expose shortened IDs to save tokens.
+# Set to 0 to disable shortening (return full IDs).
+SHORT_ID_LENGTH = 16
+
+ARTICLE_ID_PREFIX = "tag:google.com,2005:reader/item/"
+
+def shorten_id(full_id: str) -> str:
+    """Shorten a Google Reader article ID to save tokens."""
+    if SHORT_ID_LENGTH <= 0:
+        return full_id
+    if full_id.startswith(ARTICLE_ID_PREFIX):
+        return full_id[len(ARTICLE_ID_PREFIX):][:SHORT_ID_LENGTH]
+    return full_id
+
+def expand_id(short_id: str) -> str:
+    """Expand a shortened article ID back to full form."""
+    if short_id.startswith(ARTICLE_ID_PREFIX):
+        return short_id  # Already full
+    return f"{ARTICLE_ID_PREFIX}{short_id}"
+
+def expand_ids(ids: List[str]) -> List[str]:
+    """Expand a list of potentially shortened IDs."""
+    return [expand_id(i) for i in ids]
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -93,6 +119,26 @@ class SubscribeParams(BaseModel):
 class UnsubscribeParams(BaseModel):
     """Parameters for unsubscribing from a feed."""
     feed_url: str = Field(..., description="URL of the feed to unsubscribe from")
+
+
+class MarkStreamReadParams(BaseModel):
+    """Parameters for marking all articles in a stream as read."""
+    stream: str = Field(
+        "all",
+        description="What to mark as read: 'all' for everything, or a folder name like 'tech', 'ML', 'security'"
+    )
+    older_than_hours: Optional[float] = Field(
+        None,
+        description="Only mark articles older than this many hours. None = mark everything."
+    )
+
+
+class GetDigestCompactParams(BaseModel):
+    """Parameters for getting an ultra-compact category-balanced digest."""
+    per_category: int = Field(5, description="Number of articles per category (default 5)")
+    categories: Optional[List[str]] = Field(None, description="Categories to include (None = all)")
+    include_uncategorized: bool = Field(True, description="Include uncategorized feeds")
+    show_read: bool = Field(False, description="Include read articles")
 
 
 async def ensure_authenticated() -> FreshRSSClient:
@@ -350,7 +396,8 @@ async def freshrss_mark_read(params: MarkArticlesParams) -> Dict[str, Any]:
     """Mark articles as read."""
     try:
         async with await ensure_authenticated() as client:
-            response = await client.mark_as_read(params.article_ids)
+            expanded = expand_ids(params.article_ids)
+            response = await client.mark_as_read(expanded)
             
             return {
                 "success": True,
@@ -370,7 +417,8 @@ async def freshrss_mark_unread(params: MarkArticlesParams) -> Dict[str, Any]:
     """Mark articles as unread."""
     try:
         async with await ensure_authenticated() as client:
-            response = await client.mark_as_unread(params.article_ids)
+            expanded = expand_ids(params.article_ids)
+            response = await client.mark_as_unread(expanded)
             
             return {
                 "success": True,
@@ -386,11 +434,48 @@ async def freshrss_mark_unread(params: MarkArticlesParams) -> Dict[str, Any]:
 
 
 @mcp.tool()
+async def freshrss_mark_stream_read(params: MarkStreamReadParams) -> Dict[str, Any]:
+    """Mark all articles in a stream/folder as read in one call.
+
+    MUCH more efficient than marking individual articles.
+    Use 'all' to mark everything, or a folder name like 'tech', 'ML', 'security'.
+
+    Common pattern: mark_stream_read(all) then mark_unread([5 keeper IDs]).
+    """
+    try:
+        async with await ensure_authenticated() as client:
+            # Resolve stream ID
+            if params.stream == "all":
+                stream_id = "user/-/state/com.google/reading-list"
+            else:
+                stream_id = f"user/-/label/{params.stream}"
+
+            # Calculate timestamp if hours specified
+            older_than_usec = None
+            if params.older_than_hours is not None:
+                import time
+                cutoff = time.time() - (params.older_than_hours * 3600)
+                older_than_usec = int(cutoff * 1_000_000)
+
+            response = await client.mark_all_as_read(stream_id, older_than_usec)
+
+            return {
+                "success": True,
+                "message": f"Marked all articles in '{params.stream}' as read",
+                "status": response.status,
+            }
+    except Exception as e:
+        logger.error(f"Failed to mark stream as read: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
 async def freshrss_star_article(params: MarkArticlesParams) -> Dict[str, Any]:
     """Star articles."""
     try:
         async with await ensure_authenticated() as client:
-            response = await client.star_article(params.article_ids)
+            expanded = expand_ids(params.article_ids)
+            response = await client.star_article(expanded)
             
             return {
                 "success": True,
@@ -410,7 +495,8 @@ async def freshrss_unstar_article(params: MarkArticlesParams) -> Dict[str, Any]:
     """Unstar articles."""
     try:
         async with await ensure_authenticated() as client:
-            response = await client.unstar_article(params.article_ids)
+            expanded = expand_ids(params.article_ids)
+            response = await client.unstar_article(expanded)
             
             return {
                 "success": True,
@@ -527,14 +613,17 @@ async def freshrss_get_headlines(params: GetHeadlinesParams) -> Dict[str, Any]:
                     for cat in article.categories
                     if cat.startswith("user/-/label/")
                 ]
-                headlines.append({
-                    "id": article.id,
+                headline = {
+                    "id": shorten_id(article.id),
                     "title": article.title,
                     "feed": article.feed_title or "",
                     "folder": folders[0] if folders else "",
-                    "published": article.published.strftime("%Y-%m-%d %H:%M") if article.published else "",
-                    "url": article.url or "",
-                })
+                }
+                if article.published:
+                    headline["published"] = article.published.strftime("%Y-%m-%d %H:%M")
+                if article.url:
+                    headline["url"] = article.url
+                headlines.append(headline)
 
             return {
                 "success": True,
@@ -564,8 +653,10 @@ async def freshrss_get_article_detail(params: GetArticleDetailParams) -> Dict[st
     try:
         async with await ensure_authenticated() as client:
             # Fetch all articles at once using item IDs via stream/items/contents
-            items_data = await client.get_items_by_ids(params.article_ids)
+            expanded_ids = expand_ids(params.article_ids)
+            items_data = await client.get_items_by_ids(expanded_ids)
 
+            articles = []
             for article in items_data:
                 folders = [
                     cat.split("/")[-1]
@@ -633,13 +724,15 @@ async def freshrss_get_diverse_digest(params: GetDiverseDigestParams) -> Dict[st
 
                 folder_headlines = []
                 for article in stream.items:
-                    folder_headlines.append({
-                        "id": article.id,
+                    headline = {
+                        "id": shorten_id(article.id),
                         "title": article.title,
-                        "feed": article.feed_title or "",
-                        "published": article.published.strftime("%Y-%m-%d %H:%M") if article.published else "",
-                        "url": article.url or "",
-                    })
+                    }
+                    if article.feed_title:
+                        headline["feed"] = article.feed_title
+                    if article.published:
+                        headline["published"] = article.published.strftime("%Y-%m-%d %H:%M")
+                    folder_headlines.append(headline)
 
                 if folder_headlines:
                     digest[folder.label] = folder_headlines
@@ -662,13 +755,15 @@ async def freshrss_get_diverse_digest(params: GetDiverseDigestParams) -> Dict[st
                         if cat.startswith("user/-/label/")
                     ]
                     if not article_folders:
-                        uncategorized.append({
-                            "id": article.id,
+                        headline = {
+                            "id": shorten_id(article.id),
                             "title": article.title,
-                            "feed": article.feed_title or "",
-                            "published": article.published.strftime("%Y-%m-%d %H:%M") if article.published else "",
-                            "url": article.url or "",
-                        })
+                        }
+                        if article.feed_title:
+                            headline["feed"] = article.feed_title
+                        if article.published:
+                            headline["published"] = article.published.strftime("%Y-%m-%d %H:%M")
+                        uncategorized.append(headline)
                     if len(uncategorized) >= params.per_category:
                         break
 
@@ -684,6 +779,97 @@ async def freshrss_get_diverse_digest(params: GetDiverseDigestParams) -> Dict[st
             }
     except Exception as e:
         logger.error(f"Failed to get diverse digest: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def freshrss_get_digest_compact(params: GetDigestCompactParams) -> Dict[str, Any]:
+    """Get an ultra-compact category-balanced digest as plain text.
+
+    Returns ~10 tokens per article vs ~100 for JSON format.
+    Each line: [short_id] Title (Feed)
+    Grouped by category with counts.
+
+    Designed for agent curation workflows where token efficiency matters.
+    After selecting articles, use mark_stream_read + mark_unread to keep only your picks.
+    """
+    try:
+        async with await ensure_authenticated() as client:
+            tag_list = await client.get_tag_list()
+            target_folders = []
+
+            if params.categories:
+                target_folders = [f for f in tag_list.folders if f.label in params.categories]
+            else:
+                target_folders = tag_list.folders
+
+            exclude_target = None if params.show_read else "user/-/state/com.google/read"
+
+            lines = []
+            total = 0
+            categories_found = []
+
+            for folder in target_folders:
+                stream = await client.get_stream_contents(
+                    stream_id=folder.id,
+                    count=params.per_category,
+                    order="d",
+                    exclude_target=exclude_target,
+                )
+
+                if not stream.items:
+                    continue
+
+                categories_found.append(folder.label)
+                lines.append(f"\n## {folder.label} ({len(stream.items)})")
+                for article in stream.items:
+                    sid = shorten_id(article.id)
+                    feed = article.feed_title or ""
+                    # Truncate feed name to save tokens
+                    if len(feed) > 25:
+                        feed = feed[:22] + "..."
+                    lines.append(f"[{sid}] {article.title} ({feed})")
+                    total += 1
+
+            # Uncategorized
+            if params.include_uncategorized:
+                stream = await client.get_stream_contents(
+                    stream_id="user/-/state/com.google/reading-list",
+                    count=params.per_category * 2,
+                    order="d",
+                    exclude_target=exclude_target,
+                )
+                uncategorized = []
+                for article in stream.items:
+                    article_folders = [
+                        cat for cat in article.categories
+                        if cat.startswith("user/-/label/")
+                    ]
+                    if not article_folders:
+                        sid = shorten_id(article.id)
+                        feed = article.feed_title or ""
+                        if len(feed) > 25:
+                            feed = feed[:22] + "..."
+                        uncategorized.append(f"[{sid}] {article.title} ({feed})")
+                    if len(uncategorized) >= params.per_category:
+                        break
+
+                if uncategorized:
+                    categories_found.append("Uncategorized")
+                    lines.append(f"\n## Uncategorized ({len(uncategorized)})")
+                    lines.extend(uncategorized)
+                    total += len(uncategorized)
+
+            digest_text = "\n".join(lines)
+
+            return {
+                "success": True,
+                "digest": digest_text,
+                "categories": categories_found,
+                "total": total,
+            }
+    except Exception as e:
+        logger.error(f"Failed to get compact digest: {e}")
         return {"success": False, "error": str(e)}
 
 
