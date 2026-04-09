@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import random
 from typing import List, Optional, Dict, Any
 
 from dotenv import load_dotenv
@@ -11,8 +12,8 @@ from pydantic import BaseModel, Field
 
 from .client import FreshRSSClient, FreshRSSError, AuthenticationError
 
-from mcp.server.transport_security import TransportSecuritySettings  
-  
+from mcp.server.transport_security import TransportSecuritySettings
+
 
 # Load environment variables
 load_dotenv()
@@ -21,9 +22,9 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-security_settings = TransportSecuritySettings(  
-    enable_dns_rebinding_protection=False  
-)  
+security_settings = TransportSecuritySettings(
+    enable_dns_rebinding_protection=False
+)
 # Initialize MCP server
 mcp = FastMCP("FreshRSS MCP Server", transport_security=security_settings)
 
@@ -45,6 +46,30 @@ class GetArticlesParams(BaseModel):
     order: str = Field("newest", description="Sort order: 'newest' or 'oldest'")
     continuation: Optional[str] = Field(None, description="Continuation token for pagination")
     trim_content: bool = Field(True, description="trim default article body and content to first 300 characters to not overwhelm models context.")
+
+
+class GetHeadlinesParams(BaseModel):
+    """Parameters for fetching article headlines (token-efficient)."""
+    folder: Optional[str] = Field(None, description="Folder/label name to filter by")
+    feed_url: Optional[str] = Field(None, description="Feed URL to filter by")
+    show_read: bool = Field(False, description="Include read articles")
+    starred_only: bool = Field(False, description="Show only starred articles")
+    count: int = Field(100, description="Number of headlines to fetch (max ~1000)")
+    order: str = Field("newest", description="Sort order: 'newest' or 'oldest'")
+    continuation: Optional[str] = Field(None, description="Continuation token for pagination")
+
+
+class GetArticleDetailParams(BaseModel):
+    """Parameters for fetching full article content by ID."""
+    article_ids: List[str] = Field(..., description="List of article IDs to fetch full content for (max 10)")
+
+
+class GetDiverseDigestParams(BaseModel):
+    """Parameters for getting a category-balanced article digest."""
+    per_category: int = Field(5, description="Number of articles per category (default 5)")
+    categories: Optional[List[str]] = Field(None, description="Categories to include (None = all)")
+    include_uncategorized: bool = Field(True, description="Include uncategorized feeds")
+    show_read: bool = Field(False, description="Include read articles")
 
 
 class MarkArticlesParams(BaseModel):
@@ -450,18 +475,216 @@ async def freshrss_unsubscribe(params: UnsubscribeParams) -> Dict[str, Any]:
     try:
         async with await ensure_authenticated() as client:
             response = await client.unsubscribe(params.feed_url)
-            
+
             return {
                 "success": True,
-            "message": f"Successfully unsubscribed from {params.feed_url}",
-            "status": response.status
-        }
+                "message": f"Successfully unsubscribed from {params.feed_url}",
+                "status": response.status,
+            }
     except Exception as e:
         logger.error(f"Failed to unsubscribe: {e}")
         return {
             "success": False,
-            "error": str(e)
+            "error": str(e),
         }
+
+
+@mcp.tool()
+async def freshrss_get_headlines(params: GetHeadlinesParams) -> Dict[str, Any]:
+    """Get article headlines only — ultra token-efficient.
+
+    Returns only: id, title, feed_title, folder, published, url.
+    ~10x fewer tokens than get_articles. Use this for scanning/triage,
+    then call get_article_detail for articles you want to read in full.
+    """
+    try:
+        async with await ensure_authenticated() as client:
+            # Determine stream ID
+            if params.starred_only:
+                stream_id = "user/-/state/com.google/starred"
+            elif params.folder:
+                stream_id = f"user/-/label/{params.folder}"
+            elif params.feed_url:
+                stream_id = f"feed/{params.feed_url}"
+            else:
+                stream_id = "user/-/state/com.google/reading-list"
+
+            exclude_target = None if params.show_read else "user/-/state/com.google/read"
+
+            stream = await client.get_stream_contents(
+                stream_id=stream_id,
+                count=params.count,
+                order="d" if params.order == "newest" else "o",
+                exclude_target=exclude_target,
+                continuation=params.continuation,
+            )
+
+            headlines = []
+            for article in stream.items:
+                # Extract folder from categories
+                folders = [
+                    cat.split("/")[-1]
+                    for cat in article.categories
+                    if cat.startswith("user/-/label/")
+                ]
+                headlines.append({
+                    "id": article.id,
+                    "title": article.title,
+                    "feed": article.feed_title or "",
+                    "folder": folders[0] if folders else "",
+                    "published": article.published.strftime("%Y-%m-%d %H:%M") if article.published else "",
+                    "url": article.url or "",
+                })
+
+            return {
+                "success": True,
+                "headlines": headlines,
+                "count": len(headlines),
+                "has_more": stream.has_more,
+                "continuation": stream.continuation,
+            }
+    except Exception as e:
+        logger.error(f"Failed to get headlines: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def freshrss_get_article_detail(params: GetArticleDetailParams) -> Dict[str, Any]:
+    """Get full content for specific articles by ID.
+
+    Use after scanning headlines to deep-dive into interesting articles.
+    Max 10 articles per call to control token usage.
+    """
+    if len(params.article_ids) > 10:
+        return {
+            "success": False,
+            "error": "Max 10 articles per call. Use multiple calls for more.",
+        }
+
+    try:
+        async with await ensure_authenticated() as client:
+            # Fetch all articles at once using item IDs via stream/items/contents
+            items_data = await client.get_items_by_ids(params.article_ids)
+
+            for article in items_data:
+                folders = [
+                    cat.split("/")[-1]
+                    for cat in article.categories
+                    if cat.startswith("user/-/label/")
+                ]
+                articles.append({
+                    "id": article.id,
+                    "title": article.title,
+                    "url": article.url or "",
+                    "content": article.content or "",
+                    "summary": article.summary or "",
+                    "author": article.author or "",
+                    "feed": article.feed_title or "",
+                    "folder": folders[0] if folders else "",
+                    "published": article.published.isoformat() if article.published else "",
+                    "is_starred": article.is_starred,
+                })
+
+            return {
+                "success": True,
+                "articles": articles,
+                "count": len(articles),
+            }
+    except Exception as e:
+        logger.error(f"Failed to get article details: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def freshrss_get_diverse_digest(params: GetDiverseDigestParams) -> Dict[str, Any]:
+    """Get a category-balanced digest of recent unread articles.
+
+    Fetches N articles from EACH category to ensure topic diversity.
+    Returns headlines only (token-efficient). Use get_article_detail
+    to deep-dive into selected articles.
+
+    This is the primary tool for daily curation — ensures you see
+    security, business, world news, etc., not just AI/ML.
+    """
+    try:
+        async with await ensure_authenticated() as client:
+            # Get all folders/categories
+            tag_list = await client.get_tag_list()
+            target_folders = []
+
+            if params.categories:
+                target_folders = [f for f in tag_list.folders if f.label in params.categories]
+            else:
+                target_folders = tag_list.folders
+
+            exclude_target = None if params.show_read else "user/-/state/com.google/read"
+
+            digest: Dict[str, list] = {}
+            total = 0
+
+            for folder in target_folders:
+                stream_id = folder.id
+                stream = await client.get_stream_contents(
+                    stream_id=stream_id,
+                    count=params.per_category,
+                    order="d",
+                    exclude_target=exclude_target,
+                )
+
+                folder_headlines = []
+                for article in stream.items:
+                    folder_headlines.append({
+                        "id": article.id,
+                        "title": article.title,
+                        "feed": article.feed_title or "",
+                        "published": article.published.strftime("%Y-%m-%d %H:%M") if article.published else "",
+                        "url": article.url or "",
+                    })
+
+                if folder_headlines:
+                    digest[folder.label] = folder_headlines
+                    total += len(folder_headlines)
+
+            # Also fetch uncategorized if requested
+            if params.include_uncategorized:
+                # Fetch from reading-list and exclude articles already in folders
+                all_folder_ids = {f.id for f in target_folders}
+                stream = await client.get_stream_contents(
+                    stream_id="user/-/state/com.google/reading-list",
+                    count=params.per_category * 2,  # fetch extra, filter down
+                    order="d",
+                    exclude_target=exclude_target,
+                )
+                uncategorized = []
+                for article in stream.items:
+                    article_folders = [
+                        cat for cat in article.categories
+                        if cat.startswith("user/-/label/")
+                    ]
+                    if not article_folders:
+                        uncategorized.append({
+                            "id": article.id,
+                            "title": article.title,
+                            "feed": article.feed_title or "",
+                            "published": article.published.strftime("%Y-%m-%d %H:%M") if article.published else "",
+                            "url": article.url or "",
+                        })
+                    if len(uncategorized) >= params.per_category:
+                        break
+
+                if uncategorized:
+                    digest["Uncategorized"] = uncategorized
+                    total += len(uncategorized)
+
+            return {
+                "success": True,
+                "digest": digest,
+                "categories_found": list(digest.keys()),
+                "total_articles": total,
+            }
+    except Exception as e:
+        logger.error(f"Failed to get diverse digest: {e}")
+        return {"success": False, "error": str(e)}
 
 
 def main():

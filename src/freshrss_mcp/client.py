@@ -341,3 +341,40 @@ class FreshRSSClient:
         }
         response = await self._request("POST", "reader/api/0/subscription/edit", data=data)
         return EditResponse(status=(await response.text()).strip())
+
+    async def get_items_by_ids(self, item_ids: List[str]) -> List[Article]:
+        """Fetch full articles by their IDs using stream/items/contents."""
+        data: List[tuple] = [("output", "json")]
+        for item_id in item_ids:
+            data.append(("i", item_id))
+
+        response = await self._request(
+            "POST", "reader/api/0/stream/items/contents", data=data
+        )
+        result = await response.json()
+
+        articles = []
+        for item in result.get("items", []):
+            published = None
+            if "published" in item:
+                published = datetime.fromtimestamp(item["published"])
+            elif "crawlTimeMsec" in item:
+                published = datetime.fromtimestamp(int(item["crawlTimeMsec"]) / 1000)
+
+            article = Article(
+                id=item["id"],
+                title=item.get("title", ""),
+                published=published or datetime.now(),
+                updated=datetime.fromtimestamp(item["updated"]) if "updated" in item else None,
+                author=item.get("author"),
+                content=item.get("content", {}).get("content") if "content" in item else None,
+                summary=item.get("summary", {}).get("content") if "summary" in item else None,
+                categories=item.get("categories", []),
+                origin=item.get("origin"),
+                alternate=item.get("alternate", []),
+                crawlTimeMsec=item.get("crawlTimeMsec"),
+                timestampUsec=item.get("timestampUsec"),
+            )
+            articles.append(article)
+
+        return articles
